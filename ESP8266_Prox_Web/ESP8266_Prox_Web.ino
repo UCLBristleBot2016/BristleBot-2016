@@ -1,4 +1,4 @@
- #include <Arduino.h>
+#include <Arduino.h>
 #include "FS.h"
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h> 
@@ -18,9 +18,12 @@
 #define IRRXL 14    // Corresponds to GPIO14 labelled pin D5 on NodeMCU board
 
 #define PROXIMITY_INTERVAL 1000
+WebSocketsServer webSocket = WebSocketsServer(81);
+const char *ssid = "ESPap";
+const char *password = "thereisnospoon";
+// Create an instance of the server specify the port to listen on as an argument
 
-#define RIGHTMOTOR 15
-#define LEFTMOTOR 5
+ESP8266WebServer server(80);
 
 unsigned long previousMillis = 0;
 unsigned long startMicros = 0;
@@ -31,44 +34,94 @@ volatile int pulselengthL = 0;
 volatile int pulselengthR = 0;
 int oldL = 0;
 int oldR = 0;
-volatile int steer = 128;
-volatile int power = 0;
 int front = 1;
 int frontdet = 0;
 int Ldetect = 0;
 int Rdetect = 0;
 String distance;
 
+uint8_t remote_ip;
+uint8_t socketNumber;
+
  volatile int rightThreshold = 150;
  volatile int leftThreshold = 150;
 
 //----------------------------------------------------------------------- 
-//Calibration of power and steering can be done for better performance
-  void obstacleDet() {
-    if (pulselengthL > 90) { // change the limit for the obstacle detection
-        power = 255;    
-        steer = 0;
-      }
-    if (pulselengthR > 90) {
-        power = 255;
-        steer = 255;
-    }
-    if (pulselengthR > 90 && pulselengthL > 90) {
-      if (pulselengthR > pulselengthL) {
-        power = 255;
-        steer = 255;
+
+void handleWebsite(){
+ bool exist = SPIFFS.exists("/prox_sensor.html");
+  if (exist) {
+    Serial.println("The file exists");
+    File f = SPIFFS.open("/prox_sensor.html", "r");
+      if(!f){
+        Serial.println("/prox_sensor.html failed to open");
       }
       else {
-        power = 255;
-        steer =   0;
+        String data = f.readString() ;
+        server.send(200,"text/html",data);
+        f.close();
       }
-    }
-    if (pulselengthR < 90 && pulselengthL < 90) {
-      power = 100;
-      steer = 128;
-    }
+  }
+  else {
+    Serial.println("No such file found.");
   }
   
+} 
+
+//----------------------------------------------------------------------- 
+
+void handleNotFound() {
+    String message = "File Not Found\n\n";
+    message += "URI: ";
+    message += server.uri();
+    message += "\nMethod: ";
+    message += ( server.method() == HTTP_GET ) ? "GET" : "POST";
+    message += "\nArguments: ";
+    message += server.args();
+    message += "\n";
+    for ( uint8_t i = 0; i < server.args(); i++ ) {
+        message += " " + server.argName ( i ) + ": " + server.arg ( i ) + "\n";
+    }
+    server.send ( 404, "text/plain", message );
+}
+//----------------------------------------------------------------------- 
+
+// state machine states
+unsigned int state;
+#define SEQUENCE_IDLE 0x00
+#define GET_SAMPLE 0x10
+#define GET_SAMPLE__WAITING 0x12
+
+void proximityRead(void){
+if (state == SEQUENCE_IDLE){
+  return;
+  }
+else if (state == GET_SAMPLE){
+  state = GET_SAMPLE__WAITING;
+  return;
+  }
+else if (state == GET_SAMPLE__WAITING){
+   String prox_L = String (pulselengthL);
+   String prox_R = String (pulselengthR);
+
+  webSocket.sendTXT(socketNumber , "{\"left\":" + prox_L + "}");
+  webSocket.sendTXT(socketNumber , "{\"right\":" + prox_R + "}");
+ 
+  //delay(500);
+
+  return;
+  }
+}
+//----------------------------------------------------------------------- 
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+
+  IPAddress ip = webSocket.remoteIP(num);  
+  socketNumber = num;
+  state = GET_SAMPLE;
+  
+}
+
 //----------------------------------------------------------------------- 
 
 void leftProximity() {
@@ -121,11 +174,9 @@ void setup() {
     pinMode(IRTX,OUTPUT);
     pinMode(IRTXBACK,OUTPUT);
     pinMode(REDLEDBACK,OUTPUT);
-    pinMode(RIGHTMOTOR, OUTPUT);
-    pinMode(LEFTMOTOR, OUTPUT);
     
-    digitalWrite(IRTX, HIGH);
-    digitalWrite(IRTXBACK, HIGH);
+    digitalWrite(IRTX, LOW);
+    digitalWrite(IRTXBACK, LOW);
     digitalWrite(REDLED, HIGH);
     digitalWrite(REDLEDBACK, HIGH);
     digitalWrite(BLUELED, LOW);
@@ -133,14 +184,36 @@ void setup() {
     pinMode(IRRXL, INPUT_PULLUP);
     analogWriteFreq(400);
 
-    power = 100;    // starting value for power (0-255)
-    steer = 128;    // starting value for steering (0-255) [0-left ------ 128-straight ------ 255-right] 
+/* Start File System      */
+  bool ok = SPIFFS.begin();
+  if (ok) Serial.println ( "File system OK" ) ;
+  else Serial.println ( "Warning: File System did not initialise" ) ;
 
-    analogWrite(RIGHTMOTOR,constrain(power*steer >> 8, 0, 255));
-    analogWrite(LEFTMOTOR,constrain(power*(255-steer) >> 8, 0, 255));
+/* Create Access point on ESP8266     */ 
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  IPAddress myIP = WiFi.softAPIP();
+  USE_SERIAL.print("AP IP address: ");
+  USE_SERIAL.println(myIP);
+
+/* Start the HTTP server      */
+  server.on("/",handleWebsite);
+  server.on ( "/inline", []() {server.send ( 200, "text/plain", "this works as well" );} );
+  server.onNotFound ( handleNotFound );
+  server.begin();
+  USE_SERIAL.println ( "HTTP server started" );
+
+ /* Start the Web Socket server      */ 
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  USE_SERIAL.println ( "Web Socket server started" );
 }
 
 void loop() {
+    server.handleClient();
+    proximityRead();
+    webSocket.loop();
+
     unsigned long currentMillis = millis();
     if(currentMillis - previousMillis >= PROXIMITY_INTERVAL) {
       previousMillis = currentMillis;
@@ -156,16 +229,10 @@ void loop() {
       }   
      }
 
-     obstacleDet();
-     analogWrite(RIGHTMOTOR,constrain(power*steer >> 8, 0, 255));
-     analogWrite(LEFTMOTOR,constrain(power*(255-steer) >> 8, 0, 255));
-     
-     USE_SERIAL.println("Power: " + String(power) + "; Steer: " + String(steer));
-
      if (frontdet ) {
       
         distance = "Front Dist. L: " + String(pulselengthL) + " R:" + String(pulselengthR);
-        //USE_SERIAL.println(distance);
+        USE_SERIAL.println(distance);
         
      }
      
